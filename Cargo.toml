@@ -23,7 +23,8 @@ futures = "0.3"
 indicatif = "0.17"
 keyring = { version = "3", features = ["linux-native-sync-persistent", "sync-secret-service"] }
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "cookies"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls", "gzip", "cookies"] }
+curl = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

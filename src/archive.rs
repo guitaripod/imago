@@ -379,16 +379,17 @@ async fn download_with_backoff(
     }
 }
 
-/// Exponential-ish backoff. Rate limits start higher; never exceeds 15 minutes.
+/// Exponential-ish backoff. Rate limits get patient (up to 30 min); never stop retrying.
 fn backoff_delay(err: &ImagoError, attempt: u32) -> Duration {
-    let base_secs = match err {
-        ImagoError::RateLimited(_) => 90,
-        ImagoError::Auth(_) => 120, // often a soft block dressed as auth
-        ImagoError::Network(_) => 10,
-        _ => 15,
+    let (base_secs, cap_secs) = match err {
+        ImagoError::RateLimited(_) => (120u64, 30 * 60),
+        ImagoError::Auth(_) => (180, 30 * 60), // often a soft block dressed as auth
+        ImagoError::Network(_) => (15, 10 * 60),
+        _ => (20, 10 * 60),
     };
-    let step = attempt.min(8);
-    let secs = (base_secs * step as u64).max(base_secs).min(15 * 60);
+    // 1,2,4,8… capped
+    let exp = 1u64 << attempt.min(6);
+    let secs = (base_secs.saturating_mul(exp)).min(cap_secs);
     Duration::from_secs(secs)
 }
 

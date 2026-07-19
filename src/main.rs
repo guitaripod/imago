@@ -4,6 +4,7 @@ mod auth;
 mod config;
 mod error;
 mod guide;
+mod httpx;
 mod ig;
 mod logx;
 mod media;

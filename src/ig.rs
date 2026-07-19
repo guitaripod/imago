@@ -1,163 +1,37 @@
-use std::time::Duration;
-
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE, COOKIE, REFERER, USER_AGENT};
-use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
 use tracing::debug;
 
 use crate::auth::Credentials;
 use crate::error::{ImagoError, Result};
+use crate::httpx::CurlHttp;
 use crate::media::{self, expand_connection, is_feed_cursor, Page};
 
 const BASE: &str = "https://www.instagram.com";
-const APP_ID: &str = "936619743392459";
 const DOC_ID_LOGGED_IN: &str = "7898261790222653";
 const DOC_ID_LOGGED_OUT: &str = "7950326061742207";
 
 pub struct IgClient {
-    http: Client,
-    user_agent: String,
+    http: CurlHttp,
 }
 
 impl IgClient {
     pub fn new(creds: &Credentials, user_agent: &str) -> Result<Self> {
-        let ua = creds
-            .user_agent
-            .clone()
-            .unwrap_or_else(|| user_agent.to_string());
-
-        let mut headers = HeaderMap::new();
-        headers.insert(USER_AGENT, HeaderValue::from_str(&ua).unwrap());
-        headers.insert(
-            "X-IG-App-ID",
-            HeaderValue::from_static(APP_ID),
-        );
-        headers.insert(
-            "X-Requested-With",
-            HeaderValue::from_static("XMLHttpRequest"),
-        );
-        headers.insert("X-Instagram-AJAX", HeaderValue::from_static("1"));
-        headers.insert(REFERER, HeaderValue::from_static("https://www.instagram.com/"));
-        headers.insert(
-            "X-CSRFToken",
-            HeaderValue::from_str(&creds.csrf_token)
-                .map_err(|e| ImagoError::Auth(e.to_string()))?,
-        );
-        let cookie = format!(
-            "sessionid={}; csrftoken={}",
-            creds.session_id, creds.csrf_token
-        );
-        headers.insert(
-            COOKIE,
-            HeaderValue::from_str(&cookie).map_err(|e| ImagoError::Auth(e.to_string()))?,
-        );
-
-        let http = Client::builder()
-            .default_headers(headers)
-            .timeout(Duration::from_secs(60))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
-
         Ok(Self {
-            http,
-            user_agent: ua,
+            http: CurlHttp::new(creds, user_agent),
         })
     }
 
-    async fn get_json(&self, url: &str) -> Result<Value> {
-        debug!(%url, "GET");
-        let resp = self.http.get(url).send().await?;
-        self.decode(resp).await
-    }
-
-    async fn post_form(&self, url: &str, form: &[(&str, String)]) -> Result<Value> {
-        debug!(%url, "POST form");
-        let resp = self
-            .http
-            .post(url)
-            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .form(form)
-            .send()
-            .await?;
-        self.decode(resp).await
-    }
-
-    async fn decode(&self, resp: reqwest::Response) -> Result<Value> {
-        let status = resp.status();
-        if status == StatusCode::FOUND || status == StatusCode::MOVED_PERMANENTLY {
-            let loc = resp
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            if loc.contains("login") || loc.contains("challenge") || loc.contains("checkpoint") {
-                return Err(ImagoError::SessionDead);
-            }
-            // Other redirects are often soft blocks — treat as rate limit
-            return Err(ImagoError::RateLimited(format!("redirect to {loc}")));
-        }
-        let body = resp.text().await?;
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            return Err(ImagoError::RateLimited("HTTP 429".into()));
-        }
-        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-            let lower = body.to_lowercase();
-            if is_soft_block(&lower) {
-                return Err(ImagoError::RateLimited(soft_block_message(&body)));
-            }
-            if lower.contains("login_required")
-                || lower.contains("checkpoint_required")
-                || lower.contains("challenge_required")
-            {
-                return Err(ImagoError::SessionDead);
-            }
-            // Bare 401/403 without a clear login signal is usually a soft block
-            return Err(ImagoError::RateLimited(format!(
-                "HTTP {status} (treating as temporary block)"
-            )));
-        }
-        if status.is_server_error() {
-            return Err(ImagoError::Network(format!(
-                "HTTP {status}: {}",
-                body.chars().take(200).collect::<String>()
-            )));
-        }
-        if !status.is_success() {
-            let lower = body.to_lowercase();
-            if is_soft_block(&lower) {
-                return Err(ImagoError::RateLimited(soft_block_message(&body)));
-            }
-            return Err(ImagoError::Network(format!(
-                "HTTP {status}: {}",
-                body.chars().take(200).collect::<String>()
-            )));
-        }
-        let v: Value = serde_json::from_str(&body)?;
-        if v.get("status").and_then(|s| s.as_str()) == Some("fail") {
-            let msg = v
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("fail");
-            let lower = msg.to_lowercase();
-            if is_soft_block(&lower) {
-                return Err(ImagoError::RateLimited(msg.into()));
-            }
-            if v.get("require_login").and_then(|b| b.as_bool()) == Some(true)
-                || lower.contains("login_required")
-                || lower.contains("checkpoint")
-                || lower.contains("challenge")
-            {
-                return Err(ImagoError::SessionDead);
-            }
-            // Unknown fail status — retry rather than abort the archive
-            return Err(ImagoError::RateLimited(msg.into()));
-        }
-        Ok(v)
+    fn http(&self) -> CurlHttp {
+        self.http.clone()
     }
 
     pub async fn fetch_profile_page(&self, username: &str) -> Result<Page> {
         let url = format!("{BASE}/api/v1/users/web_profile_info/?username={username}");
-        let v = self.get_json(&url).await?;
+        let http = self.http();
+        let v = tokio::task::spawn_blocking(move || http.get_json(&url))
+            .await
+            .map_err(|e| ImagoError::Other(e.to_string()))??;
+
         if v.get("requires_to_login").and_then(|b| b.as_bool()) == Some(true) {
             return Err(ImagoError::SessionDead);
         }
@@ -196,10 +70,8 @@ impl IgClient {
     ) -> Result<Page> {
         let mut last_err: Option<ImagoError> = None;
 
-        // Feed REST when no cursor or feed-shaped cursor
         if after.map(is_feed_cursor).unwrap_or(true) {
             match self.fetch_feed(user_id, after).await {
-                Ok(p) if !p.assets.is_empty() || !p.has_next => return Ok(p),
                 Ok(p) => return Ok(p),
                 Err(e) => {
                     debug!(error = %e, "feed path failed");
@@ -224,7 +96,10 @@ impl IgClient {
         if let Some(a) = after {
             url.push_str(&format!("&max_id={a}"));
         }
-        let v = self.get_json(&url).await?;
+        let http = self.http();
+        let v = tokio::task::spawn_blocking(move || http.get_json(&url))
+            .await
+            .map_err(|e| ImagoError::Other(e.to_string()))??;
         let (assets, post_keys, has_next, end_cursor) = expand_connection(&v);
         Ok(Page {
             user_id: user_id.to_string(),
@@ -266,14 +141,16 @@ impl IgClient {
             variables["last"] = Value::Null;
         }
         let vars = serde_json::to_string(&variables)?;
-        let form = [
+        let form = vec![
             ("variables", vars),
             ("doc_id", doc_id.to_string()),
             ("server_timestamps", "true".into()),
         ];
-        let v = self
-            .post_form(&format!("{BASE}/graphql/query"), &form)
-            .await?;
+        let url = format!("{BASE}/graphql/query");
+        let http = self.http();
+        let v = tokio::task::spawn_blocking(move || http.post_form(&url, &form))
+            .await
+            .map_err(|e| ImagoError::Other(e.to_string()))??;
 
         let conn = extract_connection(&v).ok_or_else(|| {
             ImagoError::Parse("GraphQL response missing media connection".into())
@@ -291,36 +168,16 @@ impl IgClient {
     }
 
     pub async fn download_bytes(&self, url: &str) -> Result<Vec<u8>> {
-        let resp = self
-            .http
-            .get(url)
-            .header(USER_AGENT, &self.user_agent)
-            .send()
-            .await?;
-        let status = resp.status();
-        if status == StatusCode::TOO_MANY_REQUESTS
-            || status == StatusCode::UNAUTHORIZED
-            || status == StatusCode::FORBIDDEN
-        {
-            return Err(ImagoError::RateLimited(format!(
-                "download HTTP {status}"
-            )));
-        }
-        if status.is_server_error() || !status.is_success() {
-            return Err(ImagoError::Network(format!("download HTTP {status}")));
-        }
-        Ok(resp.bytes().await?.to_vec())
+        let http = self.http();
+        let url = url.to_string();
+        tokio::task::spawn_blocking(move || http.get_bytes(&url))
+            .await
+            .map_err(|e| ImagoError::Other(e.to_string()))?
     }
 
     pub async fn probe_session(&self) -> Result<String> {
-        // Lightweight: fetch own-ish endpoint via a known public profile seed fails without auth differently
-        let url = format!("{BASE}/api/v1/users/web_profile_info/?username=instagram");
-        let v = self.get_json(&url).await?;
-        let uname = v
-            .pointer("/data/user/username")
-            .and_then(|u| u.as_str())
-            .unwrap_or("ok");
-        Ok(uname.to_string())
+        let page = self.fetch_profile_page("instagram").await?;
+        Ok(page.username)
     }
 }
 
@@ -333,7 +190,6 @@ fn extract_connection(raw: &Value) -> Option<Value> {
         if let Some(media) = user.get("edge_owner_to_timeline_media") {
             return Some(media.clone());
         }
-        // Sometimes the connection is the user object with edges
         if user.get("edges").is_some() {
             return Some(user.clone());
         }
@@ -362,7 +218,6 @@ pub fn parse_profile_input(input: &str) -> Result<String> {
             .path_segments()
             .map(|p| p.filter(|s| !s.is_empty()).collect())
             .unwrap_or_default();
-        // drop trailing empty
         segs.retain(|x| !x.is_empty());
         if segs.is_empty() {
             return Err(ImagoError::Usage(
@@ -370,7 +225,6 @@ pub fn parse_profile_input(input: &str) -> Result<String> {
             ));
         }
         let first = segs[0];
-        // reject post/reel paths
         if matches!(first, "p" | "reel" | "reels" | "stories" | "tv") {
             return Err(ImagoError::Usage(
                 "post/reel/story URLs are not supported — pass a profile URL".into(),
@@ -380,23 +234,6 @@ pub fn parse_profile_input(input: &str) -> Result<String> {
     }
 
     validate_username(s)
-}
-
-fn is_soft_block(lower: &str) -> bool {
-    lower.contains("please wait")
-        || lower.contains("rate limit")
-        || lower.contains("too many")
-        || lower.contains("try again")
-        || lower.contains("feedback_required")
-}
-
-fn soft_block_message(body: &str) -> String {
-    let s: String = body.chars().take(120).collect();
-    if s.trim().is_empty() {
-        "temporary Instagram block".into()
-    } else {
-        s
-    }
 }
 
 fn validate_username(s: &str) -> Result<String> {
