@@ -252,8 +252,12 @@ pub fn expand_connection(data: &Value) -> (Vec<Asset>, Vec<String>, bool, Option
 }
 
 pub fn is_feed_cursor(cursor: &str) -> bool {
-    !cursor.is_empty()
-        && cursor.contains('_')
+    // Empty = "start/resume feed stream" (used after profile seed to switch
+    // off GraphQL end_cursor, which Instagram soft-blocks more aggressively).
+    if cursor.is_empty() {
+        return true;
+    }
+    cursor.contains('_')
         && cursor
             .chars()
             .all(|c| c.is_ascii_digit() || c == '_')

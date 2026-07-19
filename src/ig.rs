@@ -94,7 +94,9 @@ impl IgClient {
     async fn fetch_feed(&self, user_id: &str, after: Option<&str>) -> Result<Page> {
         let mut url = format!("{BASE}/api/v1/feed/user/{user_id}/?count=12");
         if let Some(a) = after {
-            url.push_str(&format!("&max_id={a}"));
+            if !a.is_empty() {
+                url.push_str(&format!("&max_id={a}"));
+            }
         }
         let http = self.http();
         let v = tokio::task::spawn_blocking(move || http.get_json(&url))

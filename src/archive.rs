@@ -237,7 +237,18 @@ pub async fn run(
         let _ = meta.save(&store.metadata_path());
 
         pages_done += 1;
-        cursor = page.end_cursor.clone();
+
+        // Prefer feed max_id pagination. Profile seed returns a GraphQL cursor that
+        // Instagram often soft-blocks; switch to feed stream (empty after = page 1).
+        cursor = match page.end_cursor {
+            Some(c) if crate::media::is_feed_cursor(&c) && !c.is_empty() => Some(c),
+            Some(_) if page.has_next => {
+                // GraphQL-style cursor from web_profile_info — bootstrap feed next.
+                info!("switching pagination to feed API");
+                Some(String::new())
+            }
+            other => other,
+        };
 
         // Persist job
         let state = JobState {
@@ -254,12 +265,20 @@ pub async fn run(
         let _ = state.save();
         job = Some(state);
 
-        if early_stopped || !page.has_next || cursor.is_none() {
+        if early_stopped || !page.has_next {
+            break;
+        }
+        // has_next with empty cursor still means "continue via feed bootstrap"
+        if cursor.is_none() {
             break;
         }
 
-        // polite pacing between pages
-        tokio::time::sleep(page_delay(cfg.requests_per_minute)).await;
+        // polite pacing between pages (extra pause after large download batches)
+        let mut delay = page_delay(cfg.requests_per_minute);
+        if downloaded > 0 {
+            delay = delay.saturating_mul(2).max(Duration::from_secs(3));
+        }
+        tokio::time::sleep(delay).await;
     }
 
     // mark complete

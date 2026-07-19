@@ -22,11 +22,11 @@ fn default_output() -> PathBuf {
 }
 
 fn default_rpm() -> u32 {
-    30
+    12
 }
 
 fn default_concurrency() -> usize {
-    3
+    2
 }
 
 fn default_user_agent() -> String {
