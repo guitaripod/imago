@@ -1,0 +1,43 @@
+[package]
+name = "imago"
+version = "0.1.0"
+edition = "2021"
+description = "Agent-native Instagram profile archive — drop a URL, get every asset, watch for more"
+license = "MIT"
+repository = "https://github.com/guitaripod/imago"
+homepage = "https://midgarcorp.cc/imago"
+keywords = ["instagram", "archive", "cli", "download"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+
+[[bin]]
+name = "imago"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "6"
+futures = "0.3"
+indicatif = "0.17"
+keyring = { version = "3", features = ["linux-native-sync-persistent", "sync-secret-service"] }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "cookies"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
