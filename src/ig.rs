@@ -73,6 +73,10 @@ impl IgClient {
         if after.map(is_feed_cursor).unwrap_or(true) {
             match self.fetch_feed(user_id, after).await {
                 Ok(p) => return Ok(p),
+                // Soft blocks: do not immediately hit GraphQL and burn another quota.
+                Err(e @ ImagoError::RateLimited(_)) | Err(e @ ImagoError::SessionDead) => {
+                    return Err(e);
+                }
                 Err(e) => {
                     debug!(error = %e, "feed path failed");
                     last_err = Some(e);
