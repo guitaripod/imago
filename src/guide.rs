@@ -65,8 +65,13 @@ JSON
   $XDG_DATA_HOME/imago/logs/imago.log
 
 RATE LIMITS
-  Instagram soft-blocks with 401 "Please wait a few minutes".
-  imago waits and retries; only 302-to-login is fatal (exit 2).
+  Instagram soft-blocks with 401/429 "Please wait a few minutes".
+  imago waits (up to 15 min between tries) and retries forever until the
+  profile is fully archived. Only a dead session (login redirect) is fatal
+  (exit 2). Re-run the same command to resume if you kill the process.
+
+DEFAULT OUTPUT
+  ./downloads/<username>/
 "#
     );
 }

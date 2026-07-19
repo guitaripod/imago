@@ -190,7 +190,7 @@ pub async fn run(
             .map(|asset| {
                 let client = &client;
                 async move {
-                    let bytes = client.download_bytes(&asset.url).await;
+                    let bytes = download_with_backoff(client, &asset.url, &asset.key).await;
                     (asset, bytes)
                 }
             })
@@ -222,11 +222,14 @@ pub async fn run(
                     }
                 },
                 Ok(_) => {
-                    warn!(key = %asset.key, "empty body");
+                    warn!(key = %asset.key, "empty body after retries");
                     failed += 1;
                 }
+                Err(ImagoError::SessionDead) => return Err(ImagoError::SessionDead),
                 Err(e) => {
-                    warn!(key = %asset.key, error = %e, "download failed");
+                    // Should be rare — download_with_backoff only exits on SessionDead
+                    // or empty responses converted above. Count and continue the archive.
+                    warn!(key = %asset.key, error = %e, "download gave up");
                     failed += 1;
                 }
             }
@@ -286,6 +289,8 @@ pub async fn run(
     })
 }
 
+/// Keep trying until the page succeeds or the session is truly dead.
+/// Rate limits and transient network/API errors never abort the archive.
 async fn fetch_with_backoff(
     client: &IgClient,
     username: &str,
@@ -297,41 +302,94 @@ async fn fetch_with_backoff(
     loop {
         let res = if seed_profile && cursor.is_none() {
             client.fetch_profile_page(username).await
-        } else {
-            let uid = if user_id.is_empty() {
-                // need profile first
-                let p = client.fetch_profile_page(username).await?;
-                return Ok(if cursor.is_none() {
-                    p
-                } else {
+        } else if user_id.is_empty() {
+            match client.fetch_profile_page(username).await {
+                Ok(p) if cursor.is_none() => Ok(p),
+                Ok(p) => {
                     client
                         .fetch_media_page(&p.user_id, username, cursor)
-                        .await?
-                });
-            } else {
-                user_id
-            };
-            client.fetch_media_page(uid, username, cursor).await
+                        .await
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            client.fetch_media_page(user_id, username, cursor).await
         };
 
         match res {
             Ok(p) => return Ok(p),
-            Err(ImagoError::RateLimited(msg)) => {
-                attempt += 1;
-                let wait = Duration::from_secs(60 * attempt.min(10) as u64);
-                warn!(%msg, ?wait, attempt, "rate limited — waiting");
-                tokio::time::sleep(wait).await;
-            }
             Err(ImagoError::SessionDead) => return Err(ImagoError::SessionDead),
-            Err(e) if attempt < 5 => {
-                attempt += 1;
-                let wait = Duration::from_secs(5 * attempt as u64);
-                warn!(error = %e, ?wait, "retrying page fetch");
+            Err(ImagoError::NotFound(u)) => return Err(ImagoError::NotFound(u)),
+            Err(ImagoError::Usage(m)) => return Err(ImagoError::Usage(m)),
+            Err(e) => {
+                attempt = attempt.saturating_add(1);
+                let wait = backoff_delay(&e, attempt);
+                warn!(
+                    error = %e,
+                    ?wait,
+                    attempt,
+                    "page fetch blocked — waiting, will not stop until complete"
+                );
                 tokio::time::sleep(wait).await;
             }
-            Err(e) => return Err(e),
         }
     }
+}
+
+/// Download one asset. Rate limits wait forever; other failures retry a while
+/// then surface so the archive can skip that file and continue the profile.
+async fn download_with_backoff(
+    client: &IgClient,
+    url: &str,
+    key: &str,
+) -> Result<Vec<u8>> {
+    let mut attempt = 0u32;
+    let mut non_rate_failures = 0u32;
+    loop {
+        match client.download_bytes(url).await {
+            Ok(data) if !data.is_empty() => return Ok(data),
+            Ok(_) => {
+                non_rate_failures += 1;
+                if non_rate_failures >= 15 {
+                    return Err(ImagoError::Network(format!(
+                        "empty body for {key} after {non_rate_failures} tries"
+                    )));
+                }
+                warn!(%key, non_rate_failures, "empty download body — retrying");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            Err(ImagoError::SessionDead) => return Err(ImagoError::SessionDead),
+            Err(e @ ImagoError::RateLimited(_)) | Err(e @ ImagoError::Auth(_)) => {
+                // Soft blocks: never give up on this asset until it downloads
+                attempt = attempt.saturating_add(1);
+                let wait = backoff_delay(&e, attempt);
+                warn!(%key, error = %e, ?wait, attempt, "download rate-limited — waiting");
+                tokio::time::sleep(wait).await;
+            }
+            Err(e) => {
+                non_rate_failures += 1;
+                if non_rate_failures >= 15 {
+                    return Err(e);
+                }
+                let wait = backoff_delay(&e, non_rate_failures);
+                warn!(%key, error = %e, ?wait, non_rate_failures, "download error — retrying");
+                tokio::time::sleep(wait).await;
+            }
+        }
+    }
+}
+
+/// Exponential-ish backoff. Rate limits start higher; never exceeds 15 minutes.
+fn backoff_delay(err: &ImagoError, attempt: u32) -> Duration {
+    let base_secs = match err {
+        ImagoError::RateLimited(_) => 90,
+        ImagoError::Auth(_) => 120, // often a soft block dressed as auth
+        ImagoError::Network(_) => 10,
+        _ => 15,
+    };
+    let step = attempt.min(8);
+    let secs = (base_secs * step as u64).max(base_secs).min(15 * 60);
+    Duration::from_secs(secs)
 }
 
 fn page_delay(rpm: u32) -> Duration {

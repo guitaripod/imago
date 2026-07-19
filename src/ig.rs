@@ -85,28 +85,48 @@ impl IgClient {
     async fn decode(&self, resp: reqwest::Response) -> Result<Value> {
         let status = resp.status();
         if status == StatusCode::FOUND || status == StatusCode::MOVED_PERMANENTLY {
-            return Err(ImagoError::SessionDead);
-        }
-        let body = resp.text().await?;
-        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-            let lower = body.to_lowercase();
-            if lower.contains("please wait")
-                || lower.contains("rate limit")
-                || lower.contains("too many")
-            {
-                return Err(ImagoError::RateLimited(
-                    "please wait a few minutes".into(),
-                ));
-            }
-            if lower.contains("login") || lower.contains("checkpoint") {
+            let loc = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if loc.contains("login") || loc.contains("challenge") || loc.contains("checkpoint") {
                 return Err(ImagoError::SessionDead);
             }
-            return Err(ImagoError::Auth(format!("HTTP {status}: {body}")));
+            // Other redirects are often soft blocks — treat as rate limit
+            return Err(ImagoError::RateLimited(format!("redirect to {loc}")));
         }
+        let body = resp.text().await?;
         if status == StatusCode::TOO_MANY_REQUESTS {
             return Err(ImagoError::RateLimited("HTTP 429".into()));
         }
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            let lower = body.to_lowercase();
+            if is_soft_block(&lower) {
+                return Err(ImagoError::RateLimited(soft_block_message(&body)));
+            }
+            if lower.contains("login_required")
+                || lower.contains("checkpoint_required")
+                || lower.contains("challenge_required")
+            {
+                return Err(ImagoError::SessionDead);
+            }
+            // Bare 401/403 without a clear login signal is usually a soft block
+            return Err(ImagoError::RateLimited(format!(
+                "HTTP {status} (treating as temporary block)"
+            )));
+        }
+        if status.is_server_error() {
+            return Err(ImagoError::Network(format!(
+                "HTTP {status}: {}",
+                body.chars().take(200).collect::<String>()
+            )));
+        }
         if !status.is_success() {
+            let lower = body.to_lowercase();
+            if is_soft_block(&lower) {
+                return Err(ImagoError::RateLimited(soft_block_message(&body)));
+            }
             return Err(ImagoError::Network(format!(
                 "HTTP {status}: {}",
                 body.chars().take(200).collect::<String>()
@@ -119,13 +139,18 @@ impl IgClient {
                 .and_then(|m| m.as_str())
                 .unwrap_or("fail");
             let lower = msg.to_lowercase();
-            if lower.contains("please wait") || lower.contains("rate") {
+            if is_soft_block(&lower) {
                 return Err(ImagoError::RateLimited(msg.into()));
             }
-            if v.get("require_login").and_then(|b| b.as_bool()) == Some(true) {
+            if v.get("require_login").and_then(|b| b.as_bool()) == Some(true)
+                || lower.contains("login_required")
+                || lower.contains("checkpoint")
+                || lower.contains("challenge")
+            {
                 return Err(ImagoError::SessionDead);
             }
-            return Err(ImagoError::Auth(msg.into()));
+            // Unknown fail status — retry rather than abort the archive
+            return Err(ImagoError::RateLimited(msg.into()));
         }
         Ok(v)
     }
@@ -273,10 +298,16 @@ impl IgClient {
             .send()
             .await?;
         let status = resp.status();
-        if !status.is_success() {
-            return Err(ImagoError::Network(format!(
+        if status == StatusCode::TOO_MANY_REQUESTS
+            || status == StatusCode::UNAUTHORIZED
+            || status == StatusCode::FORBIDDEN
+        {
+            return Err(ImagoError::RateLimited(format!(
                 "download HTTP {status}"
             )));
+        }
+        if status.is_server_error() || !status.is_success() {
+            return Err(ImagoError::Network(format!("download HTTP {status}")));
         }
         Ok(resp.bytes().await?.to_vec())
     }
@@ -349,6 +380,23 @@ pub fn parse_profile_input(input: &str) -> Result<String> {
     }
 
     validate_username(s)
+}
+
+fn is_soft_block(lower: &str) -> bool {
+    lower.contains("please wait")
+        || lower.contains("rate limit")
+        || lower.contains("too many")
+        || lower.contains("try again")
+        || lower.contains("feedback_required")
+}
+
+fn soft_block_message(body: &str) -> String {
+    let s: String = body.chars().take(120).collect();
+    if s.trim().is_empty() {
+        "temporary Instagram block".into()
+    } else {
+        s
+    }
 }
 
 fn validate_username(s: &str) -> Result<String> {
