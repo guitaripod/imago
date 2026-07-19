@@ -488,8 +488,10 @@ mod tests {
             "Chrome"
         );
         assert_eq!(
-            infer_browser(Path::new("/home/a/.config/BraveSoftware/Brave-Browser/Default/Cookies"))
-                .label,
+            infer_browser(Path::new(
+                "/home/a/.config/BraveSoftware/Brave-Browser/Default/Cookies"
+            ))
+            .label,
             "Brave"
         );
         assert_eq!(
