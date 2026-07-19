@@ -12,7 +12,7 @@ makedepends=('cargo')
 # The release profile already strips, so there are no debug symbols to split.
 options=(!lto !debug)
 source=("$pkgname-$pkgver.tar.gz::https://github.com/guitaripod/imago/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('f0dbfeddbd004c789be8b99a59fd4d3a809503fe204b169d7f4b3735b31f5064')
+sha256sums=('594a6a88a48709b68bbc4669181533f29a88416106ca76f144c3ce3ad95ee6d4')
 
 prepare() {
     cd "$pkgname-$pkgver"
