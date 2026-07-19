@@ -26,6 +26,12 @@ imago watch sync --json                   # weekly via cron
 
 ## Install
 
+**Arch Linux** — from the [AUR](https://aur.archlinux.org/packages/imago):
+
+```bash
+paru -S imago   # or: yay -S imago
+```
+
 **Prebuilt binary** (Linux x86-64, macOS) — from [Releases](https://github.com/guitaripod/imago/releases):
 
 ```bash
