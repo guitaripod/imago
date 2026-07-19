@@ -1,6 +1,6 @@
 [package]
 name = "imago"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Agent-native Instagram profile archive — drop a URL, get every asset, watch for more"
 license = "MIT"
