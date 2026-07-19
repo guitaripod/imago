@@ -435,6 +435,15 @@ async fn do_get(
             report.duration_ms,
             report.output_dir
         );
+        match report.posts_reported {
+            Some(reported) if reported > report.posts_archived => println!(
+                "      {} of {} posts archived ({} unavailable — pinned, private, or removed)",
+                report.posts_archived,
+                reported,
+                reported - report.posts_archived
+            ),
+            _ => println!("      {} posts archived", report.posts_archived),
+        }
     }
     Ok(if report.assets_failed > 0 {
         EXIT_PARTIAL

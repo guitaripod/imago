@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -25,6 +26,10 @@ pub struct ArchiveReport {
     pub output_dir: String,
     pub duration_ms: u64,
     pub early_stopped: bool,
+    /// Distinct posts on disk after this run.
+    pub posts_archived: u64,
+    /// Post count the profile reports (often higher: pinned/hidden/removed).
+    pub posts_reported: Option<u64>,
 }
 
 #[derive(Default)]
@@ -90,6 +95,10 @@ pub async fn run(
     let mut failed = 0u64;
     let mut early_stopped = false;
     let mut consecutive_known_posts = 0u32;
+    let mut posts_seen: HashSet<String> = HashSet::new();
+    let mut media_count: Option<u64> = None;
+    // Adaptive pacing: tighten after a blocked page, ease off on clean ones.
+    let mut throttle = Duration::ZERO;
 
     let pb = if opts.json {
         None
@@ -113,13 +122,16 @@ pub async fn run(
         }
 
         if let Some(ref pb) = pb {
+            let progress = match media_count {
+                Some(c) => format!("{}/{c} posts", posts_seen.len()),
+                None => format!("{} posts", posts_seen.len()),
+            };
             pb.set_message(format!(
-                "{username}  page {}  +{downloaded} new  ~{skipped} skip",
-                pages_done + 1
+                "{username}  {progress}  +{downloaded} new  ~{skipped} skip"
             ));
         }
 
-        let page = match fetch_with_backoff(
+        let (page, attempts) = match fetch_with_backoff(
             &client,
             username,
             &user_id,
@@ -135,6 +147,17 @@ pub async fn run(
 
         if user_id.is_empty() {
             user_id = page.user_id.clone();
+        }
+        if page.media_count.is_some() {
+            media_count = page.media_count;
+        }
+        for pk in &page.post_keys {
+            posts_seen.insert(pk.clone());
+        }
+        if attempts > 0 {
+            throttle = (throttle + Duration::from_secs(5)).min(Duration::from_secs(60));
+        } else {
+            throttle = throttle.saturating_sub(Duration::from_secs(2));
         }
 
         // Early-stop heuristic (watch sync)
@@ -263,12 +286,13 @@ pub async fn run(
             break;
         }
 
-        // polite pacing between pages (extra pause after large download batches)
+        // polite pacing between pages (extra pause after large download batches,
+        // plus any adaptive throttle accrued from recent soft blocks)
         let mut delay = page_delay(cfg.requests_per_minute);
         if downloaded > 0 {
             delay = delay.saturating_mul(2).max(Duration::from_secs(3));
         }
-        tokio::time::sleep(delay).await;
+        tokio::time::sleep(delay + throttle).await;
     }
 
     // mark complete
@@ -284,6 +308,14 @@ pub async fn run(
         pb.finish_and_clear();
     }
 
+    let final_meta = ArchiveMetadata::load_or_new(&store.metadata_path(), username, &user_id);
+    let posts_archived = final_meta
+        .assets
+        .iter()
+        .map(|a| a.shortcode.as_str())
+        .collect::<HashSet<_>>()
+        .len() as u64;
+
     Ok(ArchiveReport {
         ok: failed == 0,
         command: "get",
@@ -295,18 +327,22 @@ pub async fn run(
         output_dir: store.dir.display().to_string(),
         duration_ms: started.elapsed().as_millis() as u64,
         early_stopped,
+        posts_archived,
+        posts_reported: media_count.or(final_meta.media_count),
     })
 }
 
 /// Keep trying until the page succeeds or the session is truly dead.
 /// Rate limits and transient network/API errors never abort the archive.
+/// Returns the page plus how many backoff retries it took (0 = first try),
+/// which drives adaptive pacing.
 async fn fetch_with_backoff(
     client: &IgClient,
     username: &str,
     user_id: &str,
     cursor: Option<&str>,
     seed_profile: bool,
-) -> Result<crate::media::Page> {
+) -> Result<(crate::media::Page, u32)> {
     let mut attempt = 0u32;
     loop {
         let res = if seed_profile && cursor.is_none() {
@@ -322,7 +358,7 @@ async fn fetch_with_backoff(
         };
 
         match res {
-            Ok(p) => return Ok(p),
+            Ok(p) => return Ok((p, attempt)),
             Err(ImagoError::SessionDead) => return Err(ImagoError::SessionDead),
             Err(ImagoError::NotFound(u)) => return Err(ImagoError::NotFound(u)),
             Err(ImagoError::Usage(m)) => return Err(ImagoError::Usage(m)),
@@ -380,21 +416,55 @@ async fn download_with_backoff(client: &IgClient, url: &str, key: &str) -> Resul
     }
 }
 
-/// Exponential-ish backoff. Rate limits get patient (up to 30 min); never stop retrying.
+/// Exponential-ish backoff, capped at 5 min so recovery is quick once a soft
+/// block lifts; never stops retrying. A checkpoint/dead session is surfaced as
+/// `SessionDead` upstream instead of being waited out here.
 fn backoff_delay(err: &ImagoError, attempt: u32) -> Duration {
     let (base_secs, cap_secs) = match err {
-        ImagoError::RateLimited(_) => (120u64, 30 * 60),
-        ImagoError::Auth(_) => (180, 30 * 60), // often a soft block dressed as auth
-        ImagoError::Network(_) => (15, 10 * 60),
-        _ => (20, 10 * 60),
+        ImagoError::RateLimited(_) | ImagoError::Auth(_) => (120u64, 5 * 60),
+        ImagoError::Network(_) => (15, 5 * 60),
+        _ => (20, 5 * 60),
     };
     // 1,2,4,8… capped
     let exp = 1u64 << attempt.min(6);
     let secs = (base_secs.saturating_mul(exp)).min(cap_secs);
-    Duration::from_secs(secs)
+    Duration::from_secs_f64(secs as f64 * jitter())
+}
+
+/// ±15% multiplicative jitter so concurrent retries don't realign into bursts.
+fn jitter() -> f64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    0.85 + (nanos % 300) as f64 / 1000.0
 }
 
 fn page_delay(rpm: u32) -> Duration {
     let rpm = rpm.max(1);
     Duration::from_millis((60_000 / rpm as u64).max(500))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_is_capped_near_five_minutes() {
+        // Even at high attempt counts, a rate-limit wait never blows past
+        // ~5 min (+ jitter headroom) — recovery stays quick once a block lifts.
+        for attempt in 0..20 {
+            let d = backoff_delay(&ImagoError::RateLimited("x".into()), attempt);
+            assert!(
+                d <= Duration::from_secs(6 * 60),
+                "attempt {attempt} waited {d:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn jitter_stays_in_band() {
+        let j = jitter();
+        assert!((0.85..1.15).contains(&j), "jitter {j}");
+    }
 }

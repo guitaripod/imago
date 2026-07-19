@@ -17,7 +17,7 @@ pub enum ImagoError {
     #[error("authentication failed: {0}")]
     Auth(String),
 
-    #[error("session expired or invalid — run: imago auth login")]
+    #[error("session expired, invalid, or checkpointed — clear any \"confirm it's you\" prompt at instagram.com in your browser, then run: imago auth login")]
     SessionDead,
 
     #[error("rate limited by Instagram: {0}")]

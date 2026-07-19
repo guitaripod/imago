@@ -127,6 +127,10 @@ pub struct AssetRecord {
     pub file: String,
     pub taken_at: Option<i64>,
     pub caption: Option<String>,
+    /// Instagram's stable media id (`pk`), for cross-referencing. Absent in
+    /// archives written before this field existed.
+    #[serde(default)]
+    pub media_id: Option<String>,
 }
 
 impl ArchiveMetadata {
@@ -159,6 +163,7 @@ impl ArchiveMetadata {
             file: file.to_string(),
             taken_at: asset.taken_at,
             caption: asset.caption.clone(),
+            media_id: asset.media_id.clone(),
         });
         self.downloaded = self.assets.len() as u64;
     }

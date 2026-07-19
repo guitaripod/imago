@@ -278,6 +278,23 @@ mod tests {
     }
 
     #[test]
+    fn extracts_media_id() {
+        let node = json!({
+            "code": "ABC",
+            "id": "3802567231323369000_3086",
+            "pk": 3802567231323369000u64,
+            "media_type": 1,
+            "image_versions2": {"candidates": [{"url": "https://cdn/x.jpg", "width": 10, "height": 10}]}
+        });
+        let assets = expand_post(&node);
+        assert_eq!(assets.len(), 1);
+        assert_eq!(
+            assets[0].media_id.as_deref(),
+            Some("3802567231323369000_3086")
+        );
+    }
+
+    #[test]
     fn expand_video() {
         let node = json!({
             "shortcode": "VID1",

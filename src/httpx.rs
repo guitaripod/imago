@@ -9,6 +9,9 @@ use serde_json::Value;
 use crate::auth::Credentials;
 use crate::error::{ImagoError, Result};
 
+/// `(status, total_size, redirect_location, body)` from one HTTP request.
+type HttpResponse = (u32, Option<u64>, Option<String>, Vec<u8>);
+
 #[derive(Clone)]
 pub struct CurlHttp {
     user_agent: String,
@@ -35,8 +38,8 @@ impl CurlHttp {
     }
 
     pub fn get_json(&self, url: &str) -> Result<Value> {
-        let (status, _total, body) = self.perform("GET", url, None, None)?;
-        decode_status_body(status, &body)
+        let (status, _total, location, body) = self.perform("GET", url, None, None)?;
+        decode_status_body(status, location.as_deref(), &body)
     }
 
     pub fn post_form(&self, url: &str, form: &[(&str, String)]) -> Result<Value> {
@@ -45,8 +48,8 @@ impl CurlHttp {
             .map(|(k, v)| format!("{}={}", urlencoding_encode(k), urlencoding_encode(v)))
             .collect::<Vec<_>>()
             .join("&");
-        let (status, _total, body) = self.perform("POST", url, Some(encoded), None)?;
-        decode_status_body(status, &body)
+        let (status, _total, location, body) = self.perform("POST", url, Some(encoded), None)?;
+        decode_status_body(status, location.as_deref(), &body)
     }
 
     /// Download an asset, resuming through explicit byte ranges.
@@ -65,7 +68,7 @@ impl CurlHttp {
             if total.map(|t| start >= t).unwrap_or(false) {
                 break;
             }
-            let (status, ctotal, chunk) =
+            let (status, ctotal, _location, chunk) =
                 self.perform("GET", url, None, Some((start, start + CHUNK - 1)))?;
             if status == 416 {
                 break;
@@ -101,7 +104,7 @@ impl CurlHttp {
         url: &str,
         body: Option<String>,
         range: Option<(u64, u64)>,
-    ) -> Result<(u32, Option<u64>, Vec<u8>)> {
+    ) -> Result<HttpResponse> {
         let mut easy = Easy::new();
         easy.url(url)
             .map_err(|e| ImagoError::Network(e.to_string()))?;
@@ -178,6 +181,7 @@ impl CurlHttp {
         let mut buf = Vec::new();
         let mut range_total: Option<u64> = None;
         let mut content_length: Option<u64> = None;
+        let mut location: Option<String> = None;
         {
             let mut transfer = easy.transfer();
             transfer
@@ -193,6 +197,9 @@ impl CurlHttp {
                         Some(SizeHeader::ContentLength(l)) => content_length = Some(l),
                         None => {}
                     }
+                    if let Some(loc) = parse_location(line) {
+                        location = Some(loc);
+                    }
                     true
                 })
                 .map_err(|e| ImagoError::Network(e.to_string()))?;
@@ -204,8 +211,30 @@ impl CurlHttp {
         let status = easy
             .response_code()
             .map_err(|e| ImagoError::Network(e.to_string()))?;
-        Ok((status, range_total.or(content_length), buf))
+        Ok((status, range_total.or(content_length), location, buf))
     }
+}
+
+/// A lowercased redirect target that means "the session must re-authenticate":
+/// Instagram sends these when a session is expired, logged out, or checkpointed.
+fn is_checkpoint_target(loc: &str) -> bool {
+    ["login", "/challenge", "/checkpoint", "/accounts/"]
+        .iter()
+        .any(|needle| loc.contains(needle))
+}
+
+/// Parse a `Location:` response header (present on 3xx redirects).
+fn parse_location(line: &[u8]) -> Option<String> {
+    let line = std::str::from_utf8(line).ok()?;
+    let (name, value) = line.split_once(':')?;
+    if name.trim().eq_ignore_ascii_case("location") {
+        let v = value.trim();
+        if v.is_empty() {
+            return None;
+        }
+        return Some(v.to_string());
+    }
+    None
 }
 
 enum SizeHeader {
@@ -230,10 +259,13 @@ fn parse_size_header(line: &[u8]) -> Option<SizeHeader> {
     }
 }
 
-fn decode_status_body(status: u32, body: &[u8]) -> Result<Value> {
+fn decode_status_body(status: u32, location: Option<&str>, body: &[u8]) -> Result<Value> {
     let text = String::from_utf8_lossy(body);
     if status == 301 || status == 302 {
-        if text.contains("login") {
+        // A redirect to login/challenge/checkpoint is a dead or gated session:
+        // waiting never clears it, so surface it (exit 2) instead of looping.
+        let loc = location.unwrap_or("").to_lowercase();
+        if is_checkpoint_target(&loc) || text.to_lowercase().contains("login") {
             return Err(ImagoError::SessionDead);
         }
         return Err(ImagoError::RateLimited(format!("redirect HTTP {status}")));
@@ -329,6 +361,42 @@ fn urlencoding_encode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_redirect_is_session_dead() {
+        // 302 to a login/challenge target → SessionDead (don't wait it out)
+        let loc = "https://www.instagram.com/accounts/login/?next=/x/";
+        assert!(matches!(
+            decode_status_body(302, Some(loc), b""),
+            Err(ImagoError::SessionDead)
+        ));
+        assert!(matches!(
+            decode_status_body(302, Some("https://i.instagram.com/challenge/"), b""),
+            Err(ImagoError::SessionDead)
+        ));
+        // a bare redirect with no login target stays a (transient) rate limit
+        assert!(matches!(
+            decode_status_body(302, Some("https://www.instagram.com/"), b""),
+            Err(ImagoError::RateLimited(_))
+        ));
+    }
+
+    #[test]
+    fn classifies_checkpoint_targets() {
+        assert!(is_checkpoint_target("/accounts/login/"));
+        assert!(is_checkpoint_target("https://i.instagram.com/challenge/"));
+        assert!(is_checkpoint_target("/checkpoint/"));
+        assert!(!is_checkpoint_target("https://www.instagram.com/natgeo/"));
+    }
+
+    #[test]
+    fn parses_location_header() {
+        assert_eq!(
+            parse_location(b"location: https://x.com/y\r\n").as_deref(),
+            Some("https://x.com/y")
+        );
+        assert!(parse_location(b"Content-Type: text/html\r\n").is_none());
+    }
 
     #[test]
     fn parses_size_headers() {
