@@ -83,6 +83,21 @@ const BROWSERS: &[Browser] = &[
         macos_keychain_account: "Brave",
     },
     Browser {
+        label: "Brave Origin",
+        linux_roots: &[
+            "BraveSoftware/Brave-Origin",
+            "BraveSoftware/Brave-Origin-Beta",
+            "BraveSoftware/Brave-Origin-Nightly",
+        ],
+        macos_roots: &[
+            "BraveSoftware/Brave-Origin",
+            "BraveSoftware/Brave-Origin-Beta",
+            "BraveSoftware/Brave-Origin-Nightly",
+        ],
+        macos_keychain_service: "Brave Origin Safe Storage",
+        macos_keychain_account: "Brave Origin",
+    },
+    Browser {
         label: "Microsoft Edge",
         linux_roots: &[
             "microsoft-edge",
@@ -473,9 +488,26 @@ mod tests {
             "Chrome"
         );
         assert_eq!(
+            infer_browser(Path::new("/home/a/.config/BraveSoftware/Brave-Browser/Default/Cookies"))
+                .label,
+            "Brave"
+        );
+        assert_eq!(
             infer_browser(Path::new("/tmp/random.db")).label,
             BROWSERS[0].label
         );
+    }
+
+    #[test]
+    fn brave_origin_is_distinct_from_brave() {
+        for p in [
+            "/home/a/.config/BraveSoftware/Brave-Origin/Default/Cookies",
+            "/home/a/.config/BraveSoftware/Brave-Origin-Beta/Default/Cookies",
+            "/home/a/.config/BraveSoftware/Brave-Origin-Nightly/Default/Cookies",
+        ] {
+            assert_eq!(infer_browser(Path::new(p)).label, "Brave Origin", "{p}");
+        }
+        assert!(browser_labels().contains(&"Brave Origin"));
     }
 
     #[test]
