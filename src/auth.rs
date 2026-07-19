@@ -48,20 +48,6 @@ pub fn load(session_flag: Option<&str>, csrf_flag: Option<&str>) -> Result<Crede
         }
     }
 
-    // Back-compat with igscraper env names during migration
-    if let Ok(s) = std::env::var("IGSCRAPER_SESSION_ID") {
-        if let Ok(c) = std::env::var("IGSCRAPER_CSRF_TOKEN") {
-            let creds = Credentials {
-                session_id: s,
-                csrf_token: c,
-                user_agent: std::env::var("IGSCRAPER_USER_AGENT").ok(),
-            };
-            if creds.is_valid_shape() {
-                return Ok(creds);
-            }
-        }
-    }
-
     if let Some(creds) = load_file()? {
         return Ok(creds);
     }

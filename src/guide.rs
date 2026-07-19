@@ -31,7 +31,6 @@ AUTH
   Credential priority:
     --session-id / --csrf-token  (or a browser, when omitted)
     IMAGO_SESSION_ID + IMAGO_CSRF_TOKEN
-    IGSCRAPER_SESSION_ID + IGSCRAPER_CSRF_TOKEN  (migration)
     ~/.config/imago/credentials.json
     OS keyring service "imago"
 

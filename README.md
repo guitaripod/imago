@@ -135,10 +135,6 @@ cargo build --release
 cargo test
 ```
 
-Supersedes the old Go project **igscraper** — same job, greenfield Rust, full media,
-browser-derived auth, watchlist, agent-native I/O. Migrating? Your existing
-`IGSCRAPER_SESSION_ID` / `IGSCRAPER_CSRF_TOKEN` still work, or just run `imago auth login`.
-
 ## License
 
 MIT
