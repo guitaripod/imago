@@ -49,7 +49,8 @@ pub async fn run(
     opts: ArchiveOpts,
 ) -> Result<ArchiveReport> {
     let started = std::time::Instant::now();
-    let client = IgClient::new(creds, &cfg.user_agent)?;
+    let mut creds = creds.clone();
+    let mut client = IgClient::new(&creds, &cfg.user_agent)?;
     let base = opts
         .output
         .clone()
@@ -132,7 +133,9 @@ pub async fn run(
         }
 
         let (page, attempts) = match fetch_with_backoff(
-            &client,
+            &mut client,
+            &mut creds,
+            cfg,
             username,
             &user_id,
             cursor.as_deref(),
@@ -141,7 +144,6 @@ pub async fn run(
         .await
         {
             Ok(p) => p,
-            Err(ImagoError::SessionDead) => return Err(ImagoError::SessionDead),
             Err(e) => return Err(e),
         };
 
@@ -239,10 +241,9 @@ pub async fn run(
                     warn!(key = %asset.key, "empty body after retries");
                     failed += 1;
                 }
-                Err(ImagoError::SessionDead) => return Err(ImagoError::SessionDead),
                 Err(e) => {
-                    // Should be rare — download_with_backoff only exits on SessionDead
-                    // or empty responses converted above. Count and continue the archive.
+                    // A CDN URL that redirects to login or otherwise fails is a single
+                    // bad asset, not a reason to abort — a resume re-fetches it fresh.
                     warn!(key = %asset.key, error = %e, "download gave up");
                     failed += 1;
                 }
@@ -332,12 +333,18 @@ pub async fn run(
     })
 }
 
-/// Keep trying until the page succeeds or the session is truly dead.
-/// Rate limits and transient network/API errors never abort the archive.
-/// Returns the page plus how many backoff retries it took (0 = first try),
-/// which drives adaptive pacing.
+/// Fetch a page, recovering autonomously from anything short of a bad target.
+///
+/// Rate limits and transient errors are waited out (capped backoff). A checkpoint
+/// or dead session is not fatal: the loop keeps trying **and** re-derives a fresh
+/// session from the browser whenever one appears — so clearing an Instagram
+/// "confirm it's you" prompt (which rotates the sessionid) lets a running archive
+/// pick the new session up on its own, no restart. Only a missing profile / bad
+/// input aborts. Returns the page plus retry count (drives adaptive pacing).
 async fn fetch_with_backoff(
-    client: &IgClient,
+    client: &mut IgClient,
+    creds: &mut Credentials,
+    cfg: &Config,
     username: &str,
     user_id: &str,
     cursor: Option<&str>,
@@ -359,22 +366,57 @@ async fn fetch_with_backoff(
 
         match res {
             Ok(p) => return Ok((p, attempt)),
-            Err(ImagoError::SessionDead) => return Err(ImagoError::SessionDead),
             Err(ImagoError::NotFound(u)) => return Err(ImagoError::NotFound(u)),
             Err(ImagoError::Usage(m)) => return Err(ImagoError::Usage(m)),
             Err(e) => {
+                let gated = matches!(e, ImagoError::SessionDead | ImagoError::Auth(_));
+                if gated {
+                    if let Some(fresh) = reauth_from_browser(creds, cfg).await {
+                        *client = fresh;
+                        attempt = 0;
+                        info!("re-derived a fresh session from the browser — resuming");
+                        continue;
+                    }
+                }
                 attempt = attempt.saturating_add(1);
                 let wait = backoff_delay(&e, attempt);
-                warn!(
-                    error = %e,
-                    ?wait,
-                    attempt,
-                    "page fetch blocked — waiting, will not stop until complete"
-                );
+                if gated {
+                    warn!(
+                        error = %e, ?wait, attempt,
+                        "session checkpointed — clear the \"confirm it's you\" prompt in your \
+                         browser if it appears; auto-retrying, will not stop until complete"
+                    );
+                } else {
+                    warn!(error = %e, ?wait, attempt, "page fetch blocked — waiting");
+                }
                 tokio::time::sleep(wait).await;
             }
         }
     }
+}
+
+/// Account id (`ds_user_id`) = the leading digits of the sessionid.
+fn account_of(session_id: &str) -> String {
+    session_id
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect()
+}
+
+/// Re-read the browser cookie store and, only if it now holds a *different*
+/// session for the *same* account, swap to it (persisting for next run). Same
+/// session or a different account → `None`, so a checkpoint is waited out rather
+/// than silently switching who we're logged in as.
+async fn reauth_from_browser(creds: &mut Credentials, cfg: &Config) -> Option<IgClient> {
+    let want = account_of(&creds.session_id);
+    let fresh = crate::browser::extract(None).await.ok()?;
+    if fresh.session_id == creds.session_id || account_of(&fresh.session_id) != want {
+        return None;
+    }
+    let client = IgClient::new(&fresh, &cfg.user_agent).ok()?;
+    let _ = crate::auth::store(&fresh);
+    *creds = fresh;
+    Some(client)
 }
 
 /// Download one asset. Rate limits wait forever; other failures retry a while
@@ -417,8 +459,7 @@ async fn download_with_backoff(client: &IgClient, url: &str, key: &str) -> Resul
 }
 
 /// Exponential-ish backoff, capped at 5 min so recovery is quick once a soft
-/// block lifts; never stops retrying. A checkpoint/dead session is surfaced as
-/// `SessionDead` upstream instead of being waited out here.
+/// block or checkpoint lifts; never stops retrying.
 fn backoff_delay(err: &ImagoError, attempt: u32) -> Duration {
     let (base_secs, cap_secs) = match err {
         ImagoError::RateLimited(_) | ImagoError::Auth(_) => (120u64, 5 * 60),
@@ -460,6 +501,14 @@ mod tests {
                 "attempt {attempt} waited {d:?}"
             );
         }
+    }
+
+    #[test]
+    fn account_of_reads_leading_digits() {
+        assert_eq!(account_of("192008031%3Atoken%3A1"), "192008031");
+        assert_eq!(account_of("192008031:token"), "192008031");
+        assert_eq!(account_of(""), "");
+        assert_eq!(account_of("%3Anope"), "");
     }
 
     #[test]

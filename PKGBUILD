@@ -1,6 +1,6 @@
 # Maintainer: guitaripod <guitaripod@icloud.com>
 pkgname=imago
-pkgver=0.1.3
+pkgver=0.1.4
 pkgrel=1
 pkgdesc='Agent-native Instagram profile archive - every photo, video, and carousel slide'
 arch=('x86_64')
