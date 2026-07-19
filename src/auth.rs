@@ -23,10 +23,7 @@ impl Credentials {
     }
 }
 
-pub fn load(
-    session_flag: Option<&str>,
-    csrf_flag: Option<&str>,
-) -> Result<Credentials> {
+pub fn load(session_flag: Option<&str>, csrf_flag: Option<&str>) -> Result<Credentials> {
     if let (Some(s), Some(c)) = (session_flag, csrf_flag) {
         let creds = Credentials {
             session_id: s.to_string(),

@@ -49,10 +49,6 @@ impl Store {
         Ok(path)
     }
 
-    pub fn count_present(&self) -> usize {
-        self.present.len()
-    }
-
     pub fn metadata_path(&self) -> PathBuf {
         self.dir.join("metadata.json")
     }

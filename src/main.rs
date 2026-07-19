@@ -1,6 +1,7 @@
 mod appdata;
 mod archive;
 mod auth;
+mod browser;
 mod config;
 mod error;
 mod guide;
@@ -77,11 +78,16 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum AuthCmd {
+    /// Store a session. With no --session-id/--csrf-token, derives it from your
+    /// logged-in browser.
     Login {
         #[arg(long)]
         session_id: Option<String>,
         #[arg(long)]
         csrf_token: Option<String>,
+        /// Only read cookies from this browser (Chrome, Chromium, Brave, Vivaldi, Edge, Opera)
+        #[arg(long, env = "IMAGO_BROWSER")]
+        browser: Option<String>,
     },
     Status,
     Logout,
@@ -151,30 +157,58 @@ async fn run(cli: Cli) -> Result<u8, ImagoError> {
             AuthCmd::Login {
                 session_id,
                 csrf_token,
+                browser,
             } => {
-                let sid = session_id
-                    .or(cli.session_id.clone())
-                    .or_else(|| read_tty_line("sessionid"));
-                let csrf = csrf_token
-                    .or(cli.csrf_token.clone())
-                    .or_else(|| read_tty_line("csrftoken"));
-                let (Some(session_id), Some(csrf_token)) = (sid, csrf) else {
-                    return Err(ImagoError::Usage(
-                        "provide --session-id and --csrf-token (or env / TTY)".into(),
-                    ));
+                let sid = session_id.or(cli.session_id.clone());
+                let csrf = csrf_token.or(cli.csrf_token.clone());
+                let (creds, source) = match (sid, csrf) {
+                    (Some(session_id), Some(csrf_token)) => (
+                        auth::Credentials {
+                            session_id,
+                            csrf_token,
+                            user_agent: None,
+                        },
+                        "flags",
+                    ),
+                    _ => {
+                        if !json {
+                            eprintln!("reading your logged-in Instagram session from the browser…");
+                        }
+                        (browser::extract(browser.as_deref()).await?, "browser")
+                    }
                 };
-                let creds = auth::Credentials {
-                    session_id,
-                    csrf_token,
-                    user_agent: None,
-                };
+
+                let cfg = config::Config::load()?;
+                let alive = verify_session(&creds, &cfg).await?;
                 auth::store(&creds)?;
+
+                let user_id = creds
+                    .session_id
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>();
                 emit(
                     json,
-                    &serde_json::json!({"ok": true, "command": "auth login"}),
+                    &serde_json::json!({
+                        "ok": true,
+                        "command": "auth login",
+                        "source": source,
+                        "verified": alive,
+                        "user_id": user_id,
+                    }),
                 );
                 if !json {
-                    println!("credentials stored");
+                    match (source, alive) {
+                        ("browser", true) => {
+                            println!("stored live Instagram session (user id {user_id}) from your browser")
+                        }
+                        (_, true) => println!("credentials stored — session alive"),
+                        (_, false) => {
+                            println!(
+                                "credentials stored (could not verify right now — retry later)"
+                            )
+                        }
+                    }
                 }
                 Ok(EXIT_OK)
             }
@@ -238,129 +272,115 @@ async fn run(cli: Cli) -> Result<u8, ImagoError> {
             )
             .await
         }
-        Some(Commands::Watch { action }) => {
-            match action {
-                WatchCmd::Add {
-                    target,
-                    note,
-                    no_fetch,
-                } => {
-                    let username = ig::parse_profile_input(&target)?;
-                    let mut list = watch::Watchlist::load()?;
-                    let created = list.add(&username, note.as_deref().unwrap_or(""));
-                    list.save()?;
-                    emit(
-                        json,
-                        &serde_json::json!({
-                            "ok": true,
-                            "command": "watch add",
-                            "username": username,
-                            "created": created,
-                        }),
+        Some(Commands::Watch { action }) => match action {
+            WatchCmd::Add {
+                target,
+                note,
+                no_fetch,
+            } => {
+                let username = ig::parse_profile_input(&target)?;
+                let mut list = watch::Watchlist::load()?;
+                let created = list.add(&username, note.as_deref().unwrap_or(""));
+                list.save()?;
+                emit(
+                    json,
+                    &serde_json::json!({
+                        "ok": true,
+                        "command": "watch add",
+                        "username": username,
+                        "created": created,
+                    }),
+                );
+                if !json {
+                    println!(
+                        "{} {username}",
+                        if created { "watching" } else { "updated" }
                     );
-                    if !json {
-                        println!(
-                            "{} {username}",
-                            if created { "watching" } else { "updated" }
-                        );
-                    }
-                    if !no_fetch {
-                        return do_get(
-                            &username,
-                            false,
-                            json,
-                            cli.session_id.as_deref(),
-                            cli.csrf_token.as_deref(),
-                            cli.output.clone(),
-                        )
-                        .await;
-                    }
-                    Ok(EXIT_OK)
                 }
-                WatchCmd::List => {
-                    let list = watch::Watchlist::load()?;
-                    emit(json, &list);
-                    if !json {
-                        if list.entries.is_empty() {
-                            println!("(empty)");
-                        }
-                        for e in &list.entries {
-                            println!(
-                                "{} {:12}  last={}  new={}  {}",
-                                if e.enabled { "on " } else { "off" },
-                                e.username,
-                                e.last_synced_at.as_deref().unwrap_or("-"),
-                                e.last_new_count,
-                                e.last_status.as_deref().unwrap_or("-"),
-                            );
-                        }
-                    }
-                    Ok(EXIT_OK)
-                }
-                WatchCmd::Remove { target } => {
-                    let username = ig::parse_profile_input(&target)?;
-                    let mut list = watch::Watchlist::load()?;
-                    let removed = list.remove(&username);
-                    list.save()?;
-                    emit(
+                if !no_fetch {
+                    return do_get(
+                        &username,
+                        false,
                         json,
-                        &serde_json::json!({
-                            "ok": true,
-                            "command": "watch remove",
-                            "username": username,
-                            "removed": removed,
-                        }),
-                    );
-                    if !json {
-                        println!(
-                            "{}",
-                            if removed {
-                                format!("removed {username}")
-                            } else {
-                                format!("not watching {username}")
-                            }
-                        );
-                    }
-                    Ok(EXIT_OK)
-                }
-                WatchCmd::Sync { users, full } => {
-                    let creds =
-                        auth::load(cli.session_id.as_deref(), cli.csrf_token.as_deref())?;
-                    let cfg = config::Config::load()?;
-                    let users = if users.is_empty() {
-                        None
-                    } else {
-                        Some(users)
-                    };
-                    let report = watch::sync(
-                        users,
-                        &creds,
-                        &cfg,
-                        json,
-                        full,
+                        cli.session_id.as_deref(),
+                        cli.csrf_token.as_deref(),
                         cli.output.clone(),
                     )
-                    .await?;
-                    emit(json, &report);
-                    if !json {
-                        for r in &report.results {
-                            println!(
-                                "{}  +{} new  ~{} skip  fail={}  {}",
-                                r.username,
-                                r.assets_downloaded,
-                                r.assets_skipped,
-                                r.assets_failed,
-                                r.output_dir
-                            );
-                        }
-                        if !report.failed.is_empty() {
-                            eprintln!("failed: {}", report.failed.join(", "));
-                        }
-                    }
-                    Ok(if report.ok { EXIT_OK } else { EXIT_PARTIAL })
+                    .await;
                 }
+                Ok(EXIT_OK)
             }
-        }
+            WatchCmd::List => {
+                let list = watch::Watchlist::load()?;
+                emit(json, &list);
+                if !json {
+                    if list.entries.is_empty() {
+                        println!("(empty)");
+                    }
+                    for e in &list.entries {
+                        println!(
+                            "{} {:12}  last={}  new={}  {}",
+                            if e.enabled { "on " } else { "off" },
+                            e.username,
+                            e.last_synced_at.as_deref().unwrap_or("-"),
+                            e.last_new_count,
+                            e.last_status.as_deref().unwrap_or("-"),
+                        );
+                    }
+                }
+                Ok(EXIT_OK)
+            }
+            WatchCmd::Remove { target } => {
+                let username = ig::parse_profile_input(&target)?;
+                let mut list = watch::Watchlist::load()?;
+                let removed = list.remove(&username);
+                list.save()?;
+                emit(
+                    json,
+                    &serde_json::json!({
+                        "ok": true,
+                        "command": "watch remove",
+                        "username": username,
+                        "removed": removed,
+                    }),
+                );
+                if !json {
+                    println!(
+                        "{}",
+                        if removed {
+                            format!("removed {username}")
+                        } else {
+                            format!("not watching {username}")
+                        }
+                    );
+                }
+                Ok(EXIT_OK)
+            }
+            WatchCmd::Sync { users, full } => {
+                let creds = auth::load(cli.session_id.as_deref(), cli.csrf_token.as_deref())?;
+                let cfg = config::Config::load()?;
+                let users = if users.is_empty() { None } else { Some(users) };
+                let report =
+                    watch::sync(users, &creds, &cfg, json, full, cli.output.clone()).await?;
+                emit(json, &report);
+                if !json {
+                    for r in &report.results {
+                        println!(
+                            "{}  +{} new  ~{} skip  fail={}  {}",
+                            r.username,
+                            r.assets_downloaded,
+                            r.assets_skipped,
+                            r.assets_failed,
+                            r.output_dir
+                        );
+                    }
+                    if !report.failed.is_empty() {
+                        eprintln!("failed: {}", report.failed.join(", "));
+                    }
+                }
+                Ok(if report.ok { EXIT_OK } else { EXIT_PARTIAL })
+            }
+        },
         None => {
             let Some(target) = cli.target else {
                 if std::io::stdout().is_terminal() {
@@ -423,25 +443,20 @@ async fn do_get(
     })
 }
 
+/// Best-effort liveness check. Never fails login: a network error or rate limit
+/// returns `false` (stored unverified) rather than rejecting valid credentials.
+async fn verify_session(
+    creds: &auth::Credentials,
+    cfg: &config::Config,
+) -> Result<bool, ImagoError> {
+    let client = ig::IgClient::new(creds, &cfg.user_agent)?;
+    Ok(client.verify_login().await)
+}
+
 fn emit<T: Serialize>(json: bool, value: &T) {
     if json {
         if let Ok(s) = serde_json::to_string_pretty(value) {
             println!("{s}");
         }
     }
-}
-
-fn read_tty_line(label: &str) -> Option<String> {
-    if !std::io::stdin().is_terminal() {
-        return None;
-    }
-    eprint!("{label}: ");
-    let mut buf = String::new();
-    if std::io::stdin().read_line(&mut buf).is_ok() {
-        let t = buf.trim().to_string();
-        if !t.is_empty() {
-            return Some(t);
-        }
-    }
-    None
 }

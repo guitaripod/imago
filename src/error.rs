@@ -60,12 +60,6 @@ impl ImagoError {
 
 pub type Result<T> = std::result::Result<T, ImagoError>;
 
-impl From<reqwest::Error> for ImagoError {
-    fn from(e: reqwest::Error) -> Self {
-        Self::Network(e.to_string())
-    }
-}
-
 impl From<serde_json::Error> for ImagoError {
     fn from(e: serde_json::Error) -> Self {
         Self::Parse(e.to_string())

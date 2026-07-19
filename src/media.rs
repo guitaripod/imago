@@ -110,7 +110,9 @@ fn is_video_node(node: &Value) -> bool {
         return true;
     }
     matches!(
-        node.get("media_type").and_then(|v| v.as_f64()).map(|f| f as i64),
+        node.get("media_type")
+            .and_then(|v| v.as_f64())
+            .map(|f| f as i64),
         Some(2)
     )
 }
@@ -129,13 +131,7 @@ fn asset_from_node(node: &Value, shortcode: &str, index: u32, multi: bool) -> Op
     } else {
         best_image_url(node)?
     };
-    let ext = if video && url.contains(".mp4") {
-        "mp4"
-    } else if video {
-        "mp4"
-    } else {
-        "jpg"
-    };
+    let ext = if video { "mp4" } else { "jpg" };
     let key = if multi {
         format!("{shortcode}_{index:02}")
     } else {
@@ -194,38 +190,16 @@ pub fn expand_post(node: &Value) -> Vec<Asset> {
         .collect()
 }
 
-/// Expand a GraphQL edge list (`{ edges: [ { node: ... } ] }`) or feed `items` array.
+/// Expand a feed `items` array or a GraphQL edge list (`{ edges: [ { node: ... } ] }`).
+///
+/// Shapes are told apart by their keys, not by emptiness: an authenticated
+/// `web_profile_info` seed returns `edges: []` with a live `page_info.has_next_page`,
+/// so `page_info` is always read even when there are no edges — otherwise the archive
+/// would treat the empty seed as "no more pages" and stop before paginating the feed.
 pub fn expand_connection(data: &Value) -> (Vec<Asset>, Vec<String>, bool, Option<String>) {
     let mut assets = Vec::new();
     let mut post_keys = Vec::new();
 
-    let edges = data
-        .get("edges")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    if !edges.is_empty() {
-        for edge in &edges {
-            let node = edge.get("node").unwrap_or(edge);
-            let expanded = expand_post(node);
-            if let Some(sc) = shortcode_of(node) {
-                post_keys.push(sc);
-            }
-            assets.extend(expanded);
-        }
-        let has_next = data
-            .pointer("/page_info/has_next_page")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let cursor = data
-            .pointer("/page_info/end_cursor")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        return (assets, post_keys, has_next, cursor);
-    }
-
-    // Feed items style
     if let Some(items) = data.get("items").and_then(|v| v.as_array()) {
         for item in items {
             let expanded = expand_post(item);
@@ -238,17 +212,36 @@ pub fn expand_connection(data: &Value) -> (Vec<Asset>, Vec<String>, bool, Option
             .get("more_available")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let cursor = data
-            .get("next_max_id")
-            .and_then(|v| match v {
-                Value::String(s) => Some(s.clone()),
-                Value::Number(n) => Some(n.to_string()),
-                _ => None,
-            });
+        let cursor = data.get("next_max_id").and_then(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        });
         return (assets, post_keys, has_next, cursor);
     }
 
-    (assets, post_keys, false, None)
+    let edges = data
+        .get("edges")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for edge in &edges {
+        let node = edge.get("node").unwrap_or(edge);
+        let expanded = expand_post(node);
+        if let Some(sc) = shortcode_of(node) {
+            post_keys.push(sc);
+        }
+        assets.extend(expanded);
+    }
+    let has_next = data
+        .pointer("/page_info/has_next_page")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let cursor = data
+        .pointer("/page_info/end_cursor")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    (assets, post_keys, has_next, cursor)
 }
 
 pub fn is_feed_cursor(cursor: &str) -> bool {
@@ -257,10 +250,7 @@ pub fn is_feed_cursor(cursor: &str) -> bool {
     if cursor.is_empty() {
         return true;
     }
-    cursor.contains('_')
-        && cursor
-            .chars()
-            .all(|c| c.is_ascii_digit() || c == '_')
+    cursor.contains('_') && cursor.chars().all(|c| c.is_ascii_digit() || c == '_')
 }
 
 #[cfg(test)]
@@ -302,6 +292,34 @@ mod tests {
         assert!(assets[0].is_video);
         assert_eq!(assets[0].ext, "mp4");
         assert_eq!(assets[0].url, "https://cdn/best.mp4");
+    }
+
+    #[test]
+    fn empty_edges_still_reports_has_next() {
+        let media = json!({
+            "count": 669,
+            "edges": [],
+            "page_info": {"has_next_page": true, "end_cursor": "QVFE..."}
+        });
+        let (assets, keys, has_next, cursor) = expand_connection(&media);
+        assert!(assets.is_empty());
+        assert!(keys.is_empty());
+        assert!(has_next);
+        assert_eq!(cursor.as_deref(), Some("QVFE..."));
+    }
+
+    #[test]
+    fn feed_items_pagination() {
+        let feed = json!({
+            "items": [{"code": "X1", "media_type": 1,
+                "image_versions2": {"candidates": [{"url": "https://cdn/x.jpg", "width": 9, "height": 9}]}}],
+            "more_available": true,
+            "next_max_id": "3933126660953980213_2050"
+        });
+        let (assets, _keys, has_next, cursor) = expand_connection(&feed);
+        assert_eq!(assets.len(), 1);
+        assert!(has_next);
+        assert_eq!(cursor.as_deref(), Some("3933126660953980213_2050"));
     }
 
     #[test]

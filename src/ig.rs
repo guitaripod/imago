@@ -68,8 +68,6 @@ impl IgClient {
         username: &str,
         after: Option<&str>,
     ) -> Result<Page> {
-        let mut last_err: Option<ImagoError> = None;
-
         if after.map(is_feed_cursor).unwrap_or(true) {
             match self.fetch_feed(user_id, after).await {
                 Ok(p) => return Ok(p),
@@ -77,22 +75,11 @@ impl IgClient {
                 Err(e @ ImagoError::RateLimited(_)) | Err(e @ ImagoError::SessionDead) => {
                     return Err(e);
                 }
-                Err(e) => {
-                    debug!(error = %e, "feed path failed");
-                    last_err = Some(e);
-                }
+                Err(e) => debug!(error = %e, "feed path failed; falling back to GraphQL"),
             }
         }
 
-        match self.fetch_doc_id(user_id, username, after).await {
-            Ok(p) => return Ok(p),
-            Err(e) => {
-                debug!(error = %e, "doc_id path failed");
-                last_err = Some(e);
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| ImagoError::Other("media fetch failed".into())))
+        self.fetch_doc_id(user_id, username, after).await
     }
 
     async fn fetch_feed(&self, user_id: &str, after: Option<&str>) -> Result<Page> {
@@ -158,9 +145,8 @@ impl IgClient {
             .await
             .map_err(|e| ImagoError::Other(e.to_string()))??;
 
-        let conn = extract_connection(&v).ok_or_else(|| {
-            ImagoError::Parse("GraphQL response missing media connection".into())
-        })?;
+        let conn = extract_connection(&v)
+            .ok_or_else(|| ImagoError::Parse("GraphQL response missing media connection".into()))?;
         let (assets, post_keys, has_next, end_cursor) = expand_connection(&conn);
         Ok(Page {
             user_id: user_id.to_string(),
@@ -184,6 +170,15 @@ impl IgClient {
     pub async fn probe_session(&self) -> Result<String> {
         let page = self.fetch_profile_page("instagram").await?;
         Ok(page.username)
+    }
+
+    /// True when the stored cookies are a live login: the account's own feed
+    /// endpoint returns 200 only when authenticated (401 for anonymous/expired).
+    pub async fn verify_login(&self) -> bool {
+        match self.http.account_id() {
+            Some(uid) => self.fetch_feed(&uid, None).await.is_ok(),
+            None => false,
+        }
     }
 }
 
@@ -218,8 +213,8 @@ pub fn parse_profile_input(input: &str) -> Result<String> {
         } else {
             format!("https://{s}")
         };
-        let parsed = url::Url::parse(&url)
-            .map_err(|e| ImagoError::Usage(format!("invalid URL: {e}")))?;
+        let parsed =
+            url::Url::parse(&url).map_err(|e| ImagoError::Usage(format!("invalid URL: {e}")))?;
         let mut segs: Vec<&str> = parsed
             .path_segments()
             .map(|p| p.filter(|s| !s.is_empty()).collect())

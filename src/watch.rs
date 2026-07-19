@@ -135,7 +135,11 @@ pub async fn sync(
             Ok(report) => {
                 if let Some(e) = list.entries.iter_mut().find(|e| e.username == username) {
                     e.last_synced_at = Some(Utc::now().to_rfc3339());
-                    e.last_status = Some(if report.ok { "ok".into() } else { "partial".into() });
+                    e.last_status = Some(if report.ok {
+                        "ok".into()
+                    } else {
+                        "partial".into()
+                    });
                     e.last_new_count = report.assets_downloaded;
                     e.last_error = None;
                 }

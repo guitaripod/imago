@@ -27,6 +27,7 @@ pub struct ArchiveReport {
     pub early_stopped: bool,
 }
 
+#[derive(Default)]
 pub struct ArchiveOpts {
     pub force: bool,
     pub json: bool,
@@ -34,18 +35,6 @@ pub struct ArchiveOpts {
     /// Stop after this many consecutive already-known posts (0 = never).
     pub early_stop_known_posts: u32,
     pub max_pages: Option<u32>,
-}
-
-impl Default for ArchiveOpts {
-    fn default() -> Self {
-        Self {
-            force: false,
-            json: false,
-            output: None,
-            early_stop_known_posts: 0,
-            max_pages: None,
-        }
-    }
 }
 
 pub async fn run(
@@ -73,7 +62,10 @@ pub async fn run(
         if let Some(ref j) = job {
             if j.completed && !opts.force {
                 // Fresh incremental: start from newest without old cursor
-                info!(username, "previous job completed; starting incremental from head");
+                info!(
+                    username,
+                    "previous job completed; starting incremental from head"
+                );
                 (j.user_id.clone(), None, 0u32, 0u64, 0u64)
             } else {
                 info!(
@@ -198,8 +190,7 @@ pub async fn run(
             .collect()
             .await;
 
-        let mut meta =
-            ArchiveMetadata::load_or_new(&store.metadata_path(), username, &user_id);
+        let mut meta = ArchiveMetadata::load_or_new(&store.metadata_path(), username, &user_id);
         if page.media_count.is_some() {
             meta.media_count = page.media_count;
         }
@@ -242,12 +233,11 @@ pub async fn run(
         // Instagram often soft-blocks; switch to feed stream (empty after = page 1).
         cursor = match page.end_cursor {
             Some(c) if crate::media::is_feed_cursor(&c) && !c.is_empty() => Some(c),
-            Some(_) if page.has_next => {
-                // GraphQL-style cursor from web_profile_info — bootstrap feed next.
+            _ if page.has_next => {
                 info!("switching pagination to feed API");
                 Some(String::new())
             }
-            other => other,
+            _ => None,
         };
 
         // Persist job
@@ -324,11 +314,7 @@ async fn fetch_with_backoff(
         } else if user_id.is_empty() {
             match client.fetch_profile_page(username).await {
                 Ok(p) if cursor.is_none() => Ok(p),
-                Ok(p) => {
-                    client
-                        .fetch_media_page(&p.user_id, username, cursor)
-                        .await
-                }
+                Ok(p) => client.fetch_media_page(&p.user_id, username, cursor).await,
                 Err(e) => Err(e),
             }
         } else {
@@ -357,11 +343,7 @@ async fn fetch_with_backoff(
 
 /// Download one asset. Rate limits wait forever; other failures retry a while
 /// then surface so the archive can skip that file and continue the profile.
-async fn download_with_backoff(
-    client: &IgClient,
-    url: &str,
-    key: &str,
-) -> Result<Vec<u8>> {
+async fn download_with_backoff(client: &IgClient, url: &str, key: &str) -> Result<Vec<u8>> {
     let mut attempt = 0u32;
     let mut non_rate_failures = 0u32;
     loop {
@@ -387,10 +369,10 @@ async fn download_with_backoff(
             }
             Err(e) => {
                 non_rate_failures += 1;
-                if non_rate_failures >= 15 {
+                if non_rate_failures >= 8 {
                     return Err(e);
                 }
-                let wait = backoff_delay(&e, non_rate_failures);
+                let wait = Duration::from_secs(5);
                 warn!(%key, error = %e, ?wait, non_rate_failures, "download error — retrying");
                 tokio::time::sleep(wait).await;
             }
